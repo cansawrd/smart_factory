@@ -138,6 +138,7 @@ def compute_axis_nav_command(
     angular_sign: float = 1.0,
     allow_crossed_axis_target: bool = True,
     axis_aligned_heading: bool = True,
+    reverse_motion: bool = False,
 ) -> AxisNavCommand:
     dx = target[0] - pose.x
     dy = target[1] - pose.y
@@ -164,6 +165,8 @@ def compute_axis_nav_command(
         if axis_aligned_heading
         else math.atan2(dy, dx)
     )
+    if reverse_motion:
+        target_yaw = normalize_angle(target_yaw + math.pi)
     control_yaw = normalize_angle(pose.yaw + yaw_offset)
     yaw_error = normalize_angle(target_yaw - control_yaw)
     angular_z = _clamp(1.5 * yaw_error * angular_sign, -max_angular_speed, max_angular_speed)
@@ -183,6 +186,8 @@ def compute_axis_nav_command(
 
     speed_error = abs(axis_error) if axis_aligned_heading else distance
     linear_x = min(max_linear_speed, max(0.08, speed_error * 0.2))
+    if reverse_motion:
+        linear_x = -linear_x
     return AxisNavCommand(
         linear_x=linear_x,
         angular_z=angular_z,

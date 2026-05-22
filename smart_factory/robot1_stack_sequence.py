@@ -65,6 +65,8 @@ class MoveState:
     last_pre_align_error: float | None = None
     last_pre_align_time: float | None = None
     avoidance_applied: bool = False
+    reverse_avoidance_waypoint_index: int | None = None
+    reverse_avoidance_start_pose: Pose2D | None = None
 
 
 @dataclass
@@ -329,12 +331,19 @@ class Robot1StackSequence(Node):
             self._publish_status(f"phase={self.phase.value}; target={target_name}; done=True")
             return True
 
+        if self._continue_reverse_right_avoidance(target_name):
+            return False
+
         reservation_wait_reason = self._reservation_wait_reason(target_name)
         if reservation_wait_reason:
             self._publish_stop()
             self._publish_status(
                 f"phase={self.phase.value}; target={target_name}; reservation_wait={reservation_wait_reason}"
             )
+            return False
+
+        grid_action = self._maybe_handle_grid_edge_swap(target_name)
+        if grid_action in {"yield", "reverse_right"}:
             return False
 
         grid_wait_reason = self._grid_reservation_wait_reason()
@@ -354,11 +363,8 @@ class Robot1StackSequence(Node):
         avoidance_action = self._maybe_handle_peer_head_on(target_name, target, active_axis, control_pose)
         if avoidance_action == "yield":
             return False
-        if avoidance_action == "reroute":
-            self.move_state.segment_start_pose = control_pose
-            target = self.move_state.route.waypoints[self.move_state.waypoint_index]
-            active_axis = self.move_state.route.axes[self.move_state.waypoint_index]
-            control_pose = self._pose_for_segment(target_name, active_axis)
+        if avoidance_action == "reverse_right":
+            return False
         if self._should_pre_align_before_approach(target_name):
             if not self._step_pre_align(target_name, target, active_axis, control_pose):
                 return False
@@ -372,13 +378,14 @@ class Robot1StackSequence(Node):
             ),
             active_axis=active_axis,
             max_linear_speed=self._speed_for_segment(target_name, active_axis),
-            max_angular_speed=self.args.turn_speed,
+            max_angular_speed=self._turn_speed_for_segment(),
             distance_tolerance=self._distance_tolerance_for_segment(target_name, active_axis),
             yaw_tolerance=self.args.yaw_tolerance,
             yaw_offset=self.args.yaw_offset,
             angular_sign=self.args.angular_sign,
             allow_crossed_axis_target=self._allow_crossed_axis_target(target_name, active_axis),
             axis_aligned_heading=self._use_axis_aligned_heading(target_name, active_axis),
+            reverse_motion=self._use_reverse_motion_for_segment(),
         )
         self._publish_command(command.linear_x, command.angular_z)
         self._publish_status(
@@ -450,6 +457,16 @@ class Robot1StackSequence(Node):
             origin_y=self.args.grid_origin_y,
         )
         if self.peer_reservation is not None and self.peer_reservation.active:
+            if (
+                self.args.avoidance_role == "evade"
+                and _is_grid_edge_swap(
+                    current_cell=current_cell,
+                    next_cell=next_cell,
+                    peer_cell=self.peer_reservation.cell,
+                    peer_next_cell=self.peer_reservation.next_cell,
+                )
+            ):
+                return ""
             reason = _grid_reservation_conflict_reason(
                 robot_id=self.args.robot_id,
                 priority=self.args.reservation_priority,
@@ -556,35 +573,102 @@ class Robot1StackSequence(Node):
             )
             return "yield"
 
-        if self.move_state.avoidance_applied or self.move_state.route is None:
-            return ""
-
-        route = _build_left_bypass_route(
-            (control_pose.x, control_pose.y),
-            self.peer_pose,
-            self.move_state.route,
-            self.move_state.waypoint_index,
-            active_axis,
-            lateral_offset=self.args.peer_avoidance_lateral_offset,
-            pass_distance=self.args.peer_avoidance_pass_distance,
-        )
-        if route is None:
-            return ""
-
-        self.move_state.route = route
-        self.move_state.waypoint_index = 0
         self.move_state.segment_start_pose = None
         self.move_state.pre_aligned_waypoint_index = None
-        self.move_state.avoidance_applied = True
-        self.get_logger().info(
-            f"{self.args.robot_id} peer avoidance route: "
-            + " -> ".join(f"({x:.3f},{y:.3f})/{axis}" for (x, y), axis in zip(route.waypoints, route.axes))
+        self._publish_reverse_right_avoidance(
+            target_name,
+            source="peer_head_on",
+            detail=(
+                f"peer={self.args.peer_robot_id}; distance={distance:.3f}; "
+                f"source={self.peer_pose_source}"
+            ),
         )
+        return "reverse_right"
+
+    def _continue_reverse_right_avoidance(self, target_name: str) -> bool:
+        if self.move_state.reverse_avoidance_start_pose is None or self.pose is None:
+            return False
+        distance = math.hypot(
+            self.pose.x - self.move_state.reverse_avoidance_start_pose.x,
+            self.pose.y - self.move_state.reverse_avoidance_start_pose.y,
+        )
+        if distance >= self.args.peer_avoidance_reverse_distance:
+            self.move_state.reverse_avoidance_start_pose = None
+            return False
+        self._publish_reverse_right_avoidance(
+            target_name,
+            source="peer_head_on",
+            detail=f"reverse_distance={distance:.3f}/{self.args.peer_avoidance_reverse_distance:.3f}",
+        )
+        return True
+
+    def _publish_reverse_right_avoidance(self, target_name: str, *, source: str, detail: str) -> None:
+        if self.pose is not None and self.move_state.reverse_avoidance_start_pose is None:
+            self.move_state.reverse_avoidance_start_pose = self.pose
+        reverse_speed = -abs(self.args.peer_avoidance_speed)
+        right_turn = -abs(self.args.peer_avoidance_turn_speed) * self.args.angular_sign
+        self._publish_command(reverse_speed, right_turn)
         self._publish_status(
-            f"phase={self.phase.value}; target={target_name}; peer_head_on=reroute; "
-            f"peer={self.args.peer_robot_id}; distance={distance:.3f}; source={self.peer_pose_source}"
+            f"phase={self.phase.value}; target={target_name}; {source}=reverse_right; "
+            f"{detail}; linear={reverse_speed:.3f}; angular={right_turn:.3f}"
         )
-        return "reroute"
+
+    def _maybe_handle_grid_edge_swap(self, target_name: str) -> str:
+        if (
+            not self.args.enable_grid_reservation
+            or self.args.avoidance_role == "off"
+            or self.pose is None
+            or self.move_state.route is None
+            or self.move_state.avoidance_applied
+            or self.peer_reservation is None
+            or not self.peer_reservation.active
+        ):
+            return ""
+        if self._now() - self.peer_reservation.received_at > self.args.peer_reservation_timeout:
+            return ""
+        if self.peer_reservation.cell is None or self.peer_reservation.next_cell is None:
+            return ""
+
+        current_cell = _world_to_grid_cell(
+            self.pose.x,
+            self.pose.y,
+            cell_size=self.args.grid_cell_size,
+            origin_x=self.args.grid_origin_x,
+            origin_y=self.args.grid_origin_y,
+        )
+        next_cell = _next_grid_cell(
+            current_cell,
+            self.pose,
+            self.move_state.route,
+            self.move_state.waypoint_index,
+            cell_size=self.args.grid_cell_size,
+            origin_x=self.args.grid_origin_x,
+            origin_y=self.args.grid_origin_y,
+        )
+        if not _is_grid_edge_swap(
+            current_cell=current_cell,
+            next_cell=next_cell,
+            peer_cell=self.peer_reservation.cell,
+            peer_next_cell=self.peer_reservation.next_cell,
+        ):
+            return ""
+
+        if self.args.avoidance_role == "yield":
+            self._publish_stop()
+            self._publish_status(
+                f"phase={self.phase.value}; target={target_name}; grid_head_on=yield; "
+                f"edge={current_cell}->{next_cell}; peer={self.peer_reservation.robot_id}"
+            )
+            return "yield"
+
+        self.move_state.segment_start_pose = None
+        self.move_state.pre_aligned_waypoint_index = None
+        self._publish_reverse_right_avoidance(
+            target_name,
+            source="grid_head_on",
+            detail=f"edge={current_cell}->{next_cell}; peer={self.peer_reservation.robot_id}",
+        )
+        return "reverse_right"
 
     def _should_pre_align_before_approach(self, target_name: str) -> bool:
         if self.move_state.route is None:
@@ -658,6 +742,8 @@ class Robot1StackSequence(Node):
         return False
 
     def _speed_for_segment(self, target_name: str, active_axis: str) -> float:
+        if self.move_state.avoidance_applied and self.move_state.waypoint_index <= 2:
+            return self.args.peer_avoidance_speed
         final_waypoint_index = 0
         if self.move_state.route is not None:
             final_waypoint_index = len(self.move_state.route.waypoints) - 1
@@ -668,6 +754,11 @@ class Robot1StackSequence(Node):
         ):
             return self.args.stack_approach_speed
         return self.args.speed
+
+    def _turn_speed_for_segment(self) -> float:
+        if self.move_state.avoidance_applied and self.move_state.waypoint_index <= 2:
+            return self.args.peer_avoidance_turn_speed
+        return self.args.turn_speed
 
     def _distance_tolerance_for_segment(self, target_name: str, active_axis: str) -> float:
         if target_name == self.args.stack_target and active_axis == "y":
@@ -681,6 +772,9 @@ class Robot1StackSequence(Node):
 
     def _use_axis_aligned_heading(self, target_name: str, active_axis: str) -> bool:
         return not (target_name == self.args.stack_target and active_axis == "x")
+
+    def _use_reverse_motion_for_segment(self) -> bool:
+        return self.move_state.reverse_avoidance_waypoint_index == self.move_state.waypoint_index
 
     def _pose_for_route_start(self, target_name: str) -> Pose2D:
         if target_name == self.args.stack_target and self.center_pose is not None:
@@ -1246,6 +1340,130 @@ def _next_grid_cell(
     return current_x, current_y + direction
 
 
+def _is_grid_edge_swap(
+    *,
+    current_cell: tuple[int, int],
+    next_cell: tuple[int, int],
+    peer_cell: tuple[int, int] | None,
+    peer_next_cell: tuple[int, int] | None,
+) -> bool:
+    return peer_next_cell == current_cell and peer_cell == next_cell
+
+
+def _build_grid_reverse_right_bypass_route(
+    start: tuple[float, float],
+    route: AxisRoute,
+    waypoint_index: int,
+    *,
+    current_cell: tuple[int, int],
+    next_cell: tuple[int, int],
+    peer_cell: tuple[int, int],
+    peer_next_cell: tuple[int, int],
+    cell_size: float,
+    origin_x: float,
+    origin_y: float,
+) -> AxisRoute | None:
+    if waypoint_index >= len(route.waypoints):
+        return None
+    active_axis = route.axes[waypoint_index]
+    axis_direction = _grid_axis_direction(current_cell, next_cell, active_axis)
+    if axis_direction == 0:
+        return None
+
+    blocked_cells = {peer_cell, peer_next_cell}
+    for lateral_direction in _right_then_left_lateral_directions(active_axis, axis_direction):
+        side_cell = _offset_grid_cell(current_cell, _perpendicular_axis(active_axis), lateral_direction)
+        pass_cell = _offset_grid_cell(
+            _offset_grid_cell(next_cell, active_axis, axis_direction),
+            _perpendicular_axis(active_axis),
+            lateral_direction,
+        )
+        rejoin_cell = _offset_grid_cell(next_cell, active_axis, axis_direction)
+        if {side_cell, pass_cell, rejoin_cell} & blocked_cells:
+            continue
+
+        side_point = _cell_center(
+            side_cell,
+            cell_size=cell_size,
+            origin_x=origin_x,
+            origin_y=origin_y,
+        )
+        pass_point = _cell_center(
+            pass_cell,
+            cell_size=cell_size,
+            origin_x=origin_x,
+            origin_y=origin_y,
+        )
+        rejoin_point = _cell_center(
+            rejoin_cell,
+            cell_size=cell_size,
+            origin_x=origin_x,
+            origin_y=origin_y,
+        )
+        old_points = route.waypoints[waypoint_index:]
+        old_axes = route.axes[waypoint_index:]
+        waypoints, axes = _deduplicate_route_steps(
+            start,
+            [
+                (side_point, _perpendicular_axis(active_axis)),
+                (pass_point, active_axis),
+                (rejoin_point, _perpendicular_axis(active_axis)),
+                *zip(old_points, old_axes),
+            ],
+        )
+        return AxisRoute(target_name=route.target_name, waypoints=waypoints, axes=axes)
+    return None
+
+
+def _grid_axis_direction(
+    current_cell: tuple[int, int],
+    next_cell: tuple[int, int],
+    active_axis: str,
+) -> int:
+    if active_axis == "x":
+        return _sign(next_cell[0] - current_cell[0])
+    return _sign(next_cell[1] - current_cell[1])
+
+
+def _right_then_left_lateral_directions(active_axis: str, axis_direction: int) -> tuple[int, int]:
+    if active_axis == "x":
+        right = -axis_direction
+    else:
+        right = axis_direction
+    return right, -right
+
+
+def _offset_grid_cell(
+    cell: tuple[int, int],
+    active_axis: str,
+    direction: int,
+) -> tuple[int, int]:
+    if active_axis == "x":
+        return cell[0] + direction, cell[1]
+    return cell[0], cell[1] + direction
+
+
+def _cell_center(
+    cell: tuple[int, int],
+    *,
+    cell_size: float,
+    origin_x: float,
+    origin_y: float,
+) -> tuple[float, float]:
+    return (
+        origin_x + (cell[0] + 0.5) * cell_size,
+        origin_y + (cell[1] + 0.5) * cell_size,
+    )
+
+
+def _sign(value: int) -> int:
+    if value > 0:
+        return 1
+    if value < 0:
+        return -1
+    return 0
+
+
 def _grid_reservation_conflict_reason(
     *,
     robot_id: str,
@@ -1525,6 +1743,24 @@ def _parse_args(
         type=float,
         default=1.5,
         help="How far past the peer the evading robot rejoins the original lane.",
+    )
+    parser.add_argument(
+        "--peer-avoidance-speed",
+        type=float,
+        default=4.0,
+        help="Linear speed limit used on temporary grid/peer avoidance waypoints.",
+    )
+    parser.add_argument(
+        "--peer-avoidance-turn-speed",
+        type=float,
+        default=3.0,
+        help="Angular speed limit used on temporary grid/peer avoidance waypoints.",
+    )
+    parser.add_argument(
+        "--peer-avoidance-reverse-distance",
+        type=float,
+        default=1.5,
+        help="Minimum distance to keep reversing right after a head-on avoidance starts.",
     )
     parser.add_argument(
         "--peer-yaw-tolerance",

@@ -1,11 +1,14 @@
 from smart_factory.models import Pose2D
+from smart_factory.axis_nav_to_place import AxisRoute, compute_axis_nav_command
 from smart_factory.robot1_stack_sequence import (
     PeerReservationState,
     SequencePhase,
+    _build_grid_reverse_right_bypass_route,
     _build_left_bypass_route,
     _build_route_for_sequence_target,
     _format_reservation_status,
     _grid_reservation_conflict_reason,
+    _is_grid_edge_swap,
     _is_peer_head_on_conflict,
     _is_reserved_place,
     _limit_command_acceleration,
@@ -75,6 +78,9 @@ def test_stack_sequence_defaults_match_robot1_topics():
     assert args.peer_avoidance_path_margin == 0.5
     assert args.peer_avoidance_lateral_offset == 1.0
     assert args.peer_avoidance_pass_distance == 1.5
+    assert args.peer_avoidance_speed == 4.0
+    assert args.peer_avoidance_turn_speed == 3.0
+    assert args.peer_avoidance_reverse_distance == 1.2
     assert args.peer_yaw_tolerance == 0.75
     assert args.tracking_offset_x == -0.5
     assert args.tracking_offset_y == 0.0
@@ -394,6 +400,73 @@ def test_grid_reservation_uses_priority_for_same_next_cell():
         next_cell=(1, 0),
         peer=peer,
     ) == "peer=iw_hub_01 reserves_next=(1, 0)"
+
+
+def test_grid_edge_swap_detects_head_on_cell_exchange():
+    assert _is_grid_edge_swap(
+        current_cell=(0, 0),
+        next_cell=(1, 0),
+        peer_cell=(1, 0),
+        peer_next_cell=(0, 0),
+    )
+
+
+def test_grid_reverse_right_bypass_route_uses_right_side_first():
+    route = AxisRoute(target_name="UNLOAD_2", waypoints=[(13.0, 0.0)], axes=["x"])
+
+    bypass = _build_grid_reverse_right_bypass_route(
+        (0.2, 0.2),
+        route,
+        0,
+        current_cell=(0, 0),
+        next_cell=(1, 0),
+        peer_cell=(1, 0),
+        peer_next_cell=(0, 0),
+        cell_size=1.0,
+        origin_x=0.0,
+        origin_y=0.0,
+    )
+
+    assert bypass is not None
+    assert bypass.waypoints[:4] == [(0.5, -0.5), (2.5, -0.5), (2.5, 0.5), (13.0, 0.0)]
+    assert bypass.axes[:4] == ["y", "x", "y", "x"]
+
+
+def test_grid_reverse_right_bypass_route_tries_left_when_right_is_blocked():
+    route = AxisRoute(target_name="UNLOAD_2", waypoints=[(13.0, 0.0)], axes=["x"])
+
+    bypass = _build_grid_reverse_right_bypass_route(
+        (0.2, 0.2),
+        route,
+        0,
+        current_cell=(0, 0),
+        next_cell=(1, 0),
+        peer_cell=(0, -1),
+        peer_next_cell=(1, 0),
+        cell_size=1.0,
+        origin_x=0.0,
+        origin_y=0.0,
+    )
+
+    assert bypass is not None
+    assert bypass.waypoints[:3] == [(0.5, 1.5), (2.5, 1.5), (2.5, 0.5)]
+
+
+def test_reverse_motion_axis_nav_turns_opposite_target_and_backs_up():
+    command = compute_axis_nav_command(
+        Pose2D(0.5, 0.2, 1.57079632679),
+        (0.5, -0.5),
+        segment_start=(0.5, 0.2),
+        active_axis="y",
+        max_linear_speed=4.0,
+        max_angular_speed=2.0,
+        distance_tolerance=0.1,
+        yaw_tolerance=0.2,
+        reverse_motion=True,
+    )
+
+    assert command.linear_x < 0.0
+    assert abs(command.yaw_error) < 1e-6
 
 
 def test_world_to_grid_cell_uses_floor_with_negative_coordinates():
