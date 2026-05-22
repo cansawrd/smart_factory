@@ -48,6 +48,7 @@ class RobotAxisState:
     segment_start_pose: Pose2D | None = None
     completed: bool = False
     pose_source: str | None = None
+    avoidance_replans: int = 0
 
     @property
     def active_axis(self) -> str | None:
@@ -65,6 +66,14 @@ class ReservationDecision:
     robot_1_allowed: bool
     robot_2_allowed: bool
     reason: str
+
+
+@dataclass(frozen=True)
+class HeadOnConflict:
+    axis: str
+    distance: float
+    robot_1_direction: float
+    robot_2_direction: float
 
 
 def decide_reservations(robot_1: RobotAxisState, robot_2: RobotAxisState) -> ReservationDecision:
@@ -92,6 +101,202 @@ def should_safety_stop(robot_1: RobotAxisState, robot_2: RobotAxisState, min_saf
     if min_safe_distance <= 0.0 or robot_1.pose is None or robot_2.pose is None:
         return False
     return distance_between(robot_1.pose, robot_2.pose) < min_safe_distance
+
+
+def detect_head_on_conflict(
+    robot_1: RobotAxisState,
+    robot_2: RobotAxisState,
+    *,
+    lane_tolerance: float,
+    trigger_distance: float,
+) -> HeadOnConflict | None:
+    if (
+        robot_1.pose is None
+        or robot_2.pose is None
+        or robot_1.route is None
+        or robot_2.route is None
+        or robot_1.completed
+        or robot_2.completed
+    ):
+        return None
+
+    axis = robot_1.active_axis
+    if axis is None or axis != robot_2.active_axis:
+        return None
+
+    target_1 = robot_1.route.waypoints[robot_1.waypoint_index]
+    target_2 = robot_2.route.waypoints[robot_2.waypoint_index]
+    direction_1 = _direction_to_target(robot_1.pose, target_1, axis)
+    direction_2 = _direction_to_target(robot_2.pose, target_2, axis)
+    if direction_1 == 0.0 or direction_2 == 0.0 or direction_1 == direction_2:
+        return None
+
+    if _lateral_distance(robot_1.pose, robot_2.pose, axis) > lane_tolerance:
+        return None
+    if _lateral_distance_to_targets(target_1, target_2, axis) > lane_tolerance:
+        return None
+
+    distance = distance_between(robot_1.pose, robot_2.pose)
+    if trigger_distance > 0.0 and distance > trigger_distance:
+        return None
+
+    robot_2_ahead_of_robot_1 = (
+        _axis_value(robot_2.pose, axis) - _axis_value(robot_1.pose, axis)
+    ) * direction_1 > 0.0
+    robot_1_ahead_of_robot_2 = (
+        _axis_value(robot_1.pose, axis) - _axis_value(robot_2.pose, axis)
+    ) * direction_2 > 0.0
+    if not robot_2_ahead_of_robot_1 or not robot_1_ahead_of_robot_2:
+        return None
+
+    if not _axis_ranges_overlap(
+        (_axis_value(robot_1.pose, axis), _axis_point_value(target_1, axis)),
+        (_axis_value(robot_2.pose, axis), _axis_point_value(target_2, axis)),
+        lane_tolerance,
+    ):
+        return None
+
+    return HeadOnConflict(axis, distance, direction_1, direction_2)
+
+
+def build_left_bypass_route(
+    robot: RobotAxisState,
+    other: RobotAxisState,
+    *,
+    lateral_offset: float,
+    pass_distance: float,
+) -> AxisRoute | None:
+    if robot.pose is None or other.pose is None or robot.route is None:
+        return None
+    axis = robot.active_axis
+    if axis is None or robot.waypoint_index >= len(robot.route.waypoints):
+        return None
+
+    original_target = robot.route.waypoints[robot.waypoint_index]
+    direction = _direction_to_target(robot.pose, original_target, axis)
+    if direction == 0.0:
+        return None
+
+    offset = _left_offset(axis, direction, lateral_offset)
+    pass_axis_value = _axis_value(other.pose, axis) + direction * pass_distance
+    side_point = _offset_point_on_current_axis(robot.pose, original_target, axis, offset)
+    pass_side_point = _replace_axis_value(side_point, axis, pass_axis_value)
+    pass_lane_point = _replace_lateral_value(pass_side_point, axis, _lateral_point_value(original_target, axis))
+
+    old_points = robot.route.waypoints[robot.waypoint_index:]
+    old_axes = robot.route.axes[robot.waypoint_index:]
+    waypoints, axes = _deduplicate_route_steps(
+        (robot.pose.x, robot.pose.y),
+        [
+            (side_point, _perpendicular_axis(axis)),
+            (pass_side_point, axis),
+            (pass_lane_point, _perpendicular_axis(axis)),
+            *zip(old_points, old_axes),
+        ],
+    )
+    return AxisRoute(target_name=robot.route.target_name, waypoints=waypoints, axes=axes)
+
+
+def _axis_value(pose: Pose2D, axis: str) -> float:
+    return pose.x if axis == "x" else pose.y
+
+
+def _axis_point_value(point: tuple[float, float], axis: str) -> float:
+    return point[0] if axis == "x" else point[1]
+
+
+def _lateral_point_value(point: tuple[float, float], axis: str) -> float:
+    return point[1] if axis == "x" else point[0]
+
+
+def _lateral_distance(left: Pose2D, right: Pose2D, axis: str) -> float:
+    if axis == "x":
+        return abs(left.y - right.y)
+    return abs(left.x - right.x)
+
+
+def _lateral_distance_to_targets(
+    left: tuple[float, float],
+    right: tuple[float, float],
+    axis: str,
+) -> float:
+    return abs(_lateral_point_value(left, axis) - _lateral_point_value(right, axis))
+
+
+def _direction_to_target(pose: Pose2D, target: tuple[float, float], axis: str) -> float:
+    delta = _axis_point_value(target, axis) - _axis_value(pose, axis)
+    if math.isclose(delta, 0.0, abs_tol=1e-6):
+        return 0.0
+    return math.copysign(1.0, delta)
+
+
+def _axis_ranges_overlap(
+    left: tuple[float, float],
+    right: tuple[float, float],
+    tolerance: float,
+) -> bool:
+    left_min, left_max = sorted(left)
+    right_min, right_max = sorted(right)
+    return max(left_min, right_min) <= min(left_max, right_max) + tolerance
+
+
+def _perpendicular_axis(axis: str) -> str:
+    return "y" if axis == "x" else "x"
+
+
+def _left_offset(axis: str, direction: float, lateral_offset: float) -> float:
+    if axis == "x":
+        return math.copysign(abs(lateral_offset), direction)
+    return math.copysign(abs(lateral_offset), -direction)
+
+
+def _offset_point_on_current_axis(
+    pose: Pose2D,
+    original_target: tuple[float, float],
+    axis: str,
+    offset: float,
+) -> tuple[float, float]:
+    if axis == "x":
+        return (pose.x, original_target[1] + offset)
+    return (original_target[0] + offset, pose.y)
+
+
+def _replace_axis_value(
+    point: tuple[float, float],
+    axis: str,
+    axis_value: float,
+) -> tuple[float, float]:
+    if axis == "x":
+        return (axis_value, point[1])
+    return (point[0], axis_value)
+
+
+def _replace_lateral_value(
+    point: tuple[float, float],
+    axis: str,
+    lateral_value: float,
+) -> tuple[float, float]:
+    if axis == "x":
+        return (point[0], lateral_value)
+    return (lateral_value, point[1])
+
+
+def _deduplicate_route_steps(
+    start: tuple[float, float],
+    steps,
+) -> tuple[list[tuple[float, float]], list[str]]:
+    waypoints = []
+    axes = []
+    previous = start
+    for point, axis in steps:
+        if not (
+            math.isclose(previous[0], point[0], abs_tol=1e-3)
+            and math.isclose(previous[1], point[1], abs_tol=1e-3)
+        ):
+            waypoints.append(point)
+            axes.append(axis)
+            previous = point
+    return waypoints, axes
 
 
 class ReservedAxisNav(Node):
@@ -169,6 +374,7 @@ class ReservedAxisNav(Node):
             return
 
         self._ensure_routes()
+        avoidance_text = self._maybe_apply_head_on_avoidance()
         if should_safety_stop(self.robot_1, self.robot_2, self.args.min_safe_distance):
             robot_distance = distance_between(self.robot_1.pose, self.robot_2.pose)
             self._publish_twists(0.0, 0.0, 0.0, 0.0)
@@ -183,7 +389,8 @@ class ReservedAxisNav(Node):
         robot_1_linear, robot_1_angular, robot_1_text = self._step_robot(self.robot_1, decision.robot_1_allowed)
         robot_2_linear, robot_2_angular, robot_2_text = self._step_robot(self.robot_2, decision.robot_2_allowed)
         self._publish_twists(robot_1_linear, robot_1_angular, robot_2_linear, robot_2_angular)
-        self._publish_status(f"reservation={decision.reason}; {robot_1_text}; {robot_2_text}")
+        avoidance_prefix = f"{avoidance_text}; " if avoidance_text else ""
+        self._publish_status(f"{avoidance_prefix}reservation={decision.reason}; {robot_1_text}; {robot_2_text}")
 
     def _ensure_routes(self) -> None:
         for robot in (self.robot_1, self.robot_2):
@@ -197,6 +404,51 @@ class ReservedAxisNav(Node):
                     f"{robot.robot_id} route to {robot.target_name}: "
                     + " -> ".join(f"({x:.3f},{y:.3f})" for x, y in robot.route.waypoints)
                 )
+
+    def _maybe_apply_head_on_avoidance(self) -> str:
+        if not self.args.enable_head_on_avoidance:
+            return ""
+        conflict = detect_head_on_conflict(
+            self.robot_1,
+            self.robot_2,
+            lane_tolerance=self.args.head_on_lane_tolerance,
+            trigger_distance=self.args.head_on_trigger_distance,
+        )
+        if conflict is None:
+            return ""
+
+        evader = self.robot_2 if self.args.avoidance_evader == "robot_2" else self.robot_1
+        other = self.robot_1 if evader is self.robot_2 else self.robot_2
+        if evader.avoidance_replans >= self.args.max_avoidance_replans:
+            return (
+                f"head_on_conflict axis={conflict.axis} distance={conflict.distance:.3f}; "
+                f"{evader.robot_id}=avoidance_limit"
+            )
+
+        route = build_left_bypass_route(
+            evader,
+            other,
+            lateral_offset=self.args.avoidance_lateral_offset,
+            pass_distance=self.args.avoidance_pass_distance,
+        )
+        if route is None:
+            return (
+                f"head_on_conflict axis={conflict.axis} distance={conflict.distance:.3f}; "
+                f"{evader.robot_id}=avoidance_unavailable"
+            )
+
+        evader.route = route
+        evader.waypoint_index = 0
+        evader.segment_start_pose = None
+        evader.avoidance_replans += 1
+        self.get_logger().info(
+            f"{evader.robot_id} head-on avoidance route: "
+            + " -> ".join(f"({x:.3f},{y:.3f})/{axis}" for (x, y), axis in zip(route.waypoints, route.axes))
+        )
+        return (
+            f"head_on_avoidance evader={evader.robot_id} axis={conflict.axis} "
+            f"distance={conflict.distance:.3f}"
+        )
 
     def _step_robot(self, robot: RobotAxisState, allowed: bool) -> tuple[float, float, str]:
         if robot.route is None or robot.pose is None:
@@ -356,6 +608,48 @@ def _parse_args(args: Optional[list[str]] = None) -> argparse.Namespace:
         type=float,
         default=1.2,
         help="Stop both robots when their odom positions are closer than this distance. Use 0 to disable.",
+    )
+    parser.add_argument(
+        "--enable-head-on-avoidance",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Insert a left-side dogleg route when both robots approach each other on the same axis segment.",
+    )
+    parser.add_argument(
+        "--avoidance-evader",
+        choices=["robot_1", "robot_2"],
+        default="robot_2",
+        help="Robot that inserts the bypass when a head-on conflict is detected.",
+    )
+    parser.add_argument(
+        "--head-on-lane-tolerance",
+        type=float,
+        default=0.35,
+        help="Maximum lateral distance for two same-axis segments to be treated as the same lane.",
+    )
+    parser.add_argument(
+        "--head-on-trigger-distance",
+        type=float,
+        default=5.0,
+        help="Start bypass planning when head-on robots are within this distance. Use 0 to ignore distance.",
+    )
+    parser.add_argument(
+        "--avoidance-lateral-offset",
+        type=float,
+        default=1.0,
+        help="Side-step distance for the temporary bypass lane.",
+    )
+    parser.add_argument(
+        "--avoidance-pass-distance",
+        type=float,
+        default=1.5,
+        help="How far past the other robot the bypass route rejoins the original lane.",
+    )
+    parser.add_argument(
+        "--max-avoidance-replans",
+        type=int,
+        default=1,
+        help="Maximum number of bypass insertions per robot for one navigation run.",
     )
     parser.add_argument("--yaw-offset", type=float, default=0.0)
     parser.add_argument("--angular-sign", type=float, choices=[-1.0, 1.0], default=1.0)

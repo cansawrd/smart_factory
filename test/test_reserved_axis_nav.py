@@ -2,7 +2,9 @@ from smart_factory.models import Pose2D
 from smart_factory.reserved_axis_nav import (
     RobotAxisState,
     _frame_matches_robot,
+    build_left_bypass_route,
     decide_reservations,
+    detect_head_on_conflict,
     should_safety_stop,
 )
 from smart_factory.axis_nav_to_place import build_axis_route
@@ -72,6 +74,58 @@ def test_should_not_safety_stop_when_disabled():
     robot_2 = _robot("r2", "A2")
 
     assert not should_safety_stop(robot_1, robot_2, min_safe_distance=0.0)
+
+
+def test_detect_head_on_conflict_on_same_axis_lane():
+    robot_1 = RobotAxisState("r1", "UNLOAD_2", pose=Pose2D(0.0, 0.0, 0.0))
+    robot_1.route = build_axis_route((0.0, 0.0), "UNLOAD_2", axis_order="xy")
+    robot_2 = RobotAxisState("r2", "STACK_1", pose=Pose2D(3.0, 0.0, 3.14))
+    robot_2.route = build_axis_route((3.0, 0.0), "STACK_1", axis_order="xy")
+
+    conflict = detect_head_on_conflict(
+        robot_1,
+        robot_2,
+        lane_tolerance=0.2,
+        trigger_distance=5.0,
+    )
+
+    assert conflict is not None
+    assert conflict.axis == "x"
+    assert conflict.robot_1_direction == 1.0
+    assert conflict.robot_2_direction == -1.0
+
+
+def test_detect_head_on_conflict_ignores_same_direction_traffic():
+    robot_1 = RobotAxisState("r1", "UNLOAD_2", pose=Pose2D(0.0, 0.0, 0.0))
+    robot_1.route = build_axis_route((0.0, 0.0), "UNLOAD_2", axis_order="xy")
+    robot_2 = RobotAxisState("r2", "UNLOAD_3", pose=Pose2D(3.0, 0.0, 0.0))
+    robot_2.route = build_axis_route((3.0, 0.0), "UNLOAD_3", axis_order="xy")
+
+    conflict = detect_head_on_conflict(
+        robot_1,
+        robot_2,
+        lane_tolerance=0.2,
+        trigger_distance=5.0,
+    )
+
+    assert conflict is None
+
+
+def test_build_left_bypass_route_inserts_left_side_dogleg():
+    robot_1 = RobotAxisState("r1", "UNLOAD_2", pose=Pose2D(0.0, 0.0, 0.0))
+    robot_1.route = build_axis_route((0.0, 0.0), "UNLOAD_2", axis_order="xy")
+    robot_2 = RobotAxisState("r2", "STACK_1", pose=Pose2D(3.0, 0.0, 3.14))
+
+    route = build_left_bypass_route(
+        robot_1,
+        robot_2,
+        lateral_offset=1.0,
+        pass_distance=1.5,
+    )
+
+    assert route is not None
+    assert route.waypoints[:4] == [(0.0, 1.0), (4.5, 1.0), (4.5, 0.0), (13.0, 0.0)]
+    assert route.axes[:4] == ["y", "x", "y", "x"]
 
 
 def test_frame_matches_robot_accepts_isaac_transform_tree_frames():

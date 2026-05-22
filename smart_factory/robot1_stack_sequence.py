@@ -8,6 +8,7 @@ from typing import Optional
 
 from smart_factory.axis_nav_to_place import (
     AxisRoute,
+    PLACES,
     build_axis_route,
     compute_axis_nav_command,
 )
@@ -47,7 +48,10 @@ class SequencePhase(Enum):
     MOVE_TO_SHELF_STORAGE = "move_to_shelf_storage"
     STOP_AT_SHELF_STORAGE = "stop_at_shelf_storage"
     MOVE_TO_UNLOAD_1 = "move_to_unload_1"
+    SETTLE_AT_UNLOAD = "settle_at_unload"
     LIFT_DOWN = "lift_down"
+    BACK_OUT_FROM_UNLOAD = "back_out_from_unload"
+    MOVE_TO_WAIT_1 = "move_to_wait_1"
     COMPLETE = "complete"
 
 
@@ -57,19 +61,45 @@ class MoveState:
     route: AxisRoute | None = None
     waypoint_index: int = 0
     segment_start_pose: Pose2D | None = None
+    pre_aligned_waypoint_index: int | None = None
+    last_pre_align_error: float | None = None
+    last_pre_align_time: float | None = None
+    avoidance_applied: bool = False
+
+
+@dataclass
+class PeerReservationState:
+    robot_id: str
+    phase: str
+    target_name: str
+    priority: int
+    active: bool
+    received_at: float
+    cell: tuple[int, int] | None = None
+    next_cell: tuple[int, int] | None = None
 
 
 class Robot1StackSequence(Node):
     def __init__(self, args: argparse.Namespace) -> None:
-        super().__init__("smart_factory_robot1_stack_sequence")
+        super().__init__(f"smart_factory_{args.robot_id}_stack_sequence")
         self.args = args
         self.odom_pose: Pose2D | None = None
         self.tf_pose: Pose2D | None = None
+        self.center_pose: Pose2D | None = None
         self.pose_source: str | None = None
         self.pose: Pose2D | None = None
+        self.peer_odom_pose: Pose2D | None = None
+        self.peer_tf_pose: Pose2D | None = None
+        self.peer_pose: Pose2D | None = None
+        self.peer_pose_source: str | None = None
+        self.last_command_linear_x: float | None = None
+        self.last_command_angular_z: float | None = None
+        self.last_command_time: float | None = None
+        self.peer_reservation: PeerReservationState | None = None
+        self.peer_safety_paused = False
         self.phase = SequencePhase.MOVE_TO_STACK
         self.phase_started_at = self._now()
-        self.move_state = MoveState("STACK")
+        self.move_state = MoveState(args.stack_target)
 
         isaac_qos = QoSProfile(
             history=HistoryPolicy.KEEP_LAST,
@@ -80,6 +110,7 @@ class Robot1StackSequence(Node):
         self.cmd_pub = self.create_publisher(Twist, args.cmd_vel_topic, 10)
         self.lift_pub = self.create_publisher(JointState, args.lift_topic, 10)
         self.status_pub = self.create_publisher(String, args.status_topic, 10)
+        self.reservation_pub = self.create_publisher(String, args.reservation_topic, 10)
         self._odom_subscription = self.create_subscription(
             Odometry,
             args.odom_topic,
@@ -92,11 +123,31 @@ class Robot1StackSequence(Node):
             self._on_tf,
             isaac_qos,
         )
+        self._peer_odom_subscription = self.create_subscription(
+            Odometry,
+            args.peer_odom_topic,
+            self._on_peer_odom,
+            isaac_qos,
+        )
+        self._peer_tf_subscription = self.create_subscription(
+            TFMessage,
+            args.peer_tf_topic,
+            self._on_peer_tf,
+            isaac_qos,
+        )
+        self._peer_reservation_subscription = self.create_subscription(
+            String,
+            args.peer_reservation_topic,
+            self._on_peer_reservation,
+            10,
+        )
         self.timer = self.create_timer(1.0 / args.rate, self._on_timer)
         self.get_logger().info(
-            "Robot1 stack sequence: STACK -> lift up -> wait -> "
-            "SHELF_STORAGE -> stop -> UNLOAD_1 -> lift down; "
-            f"pose_source={args.pose_source}"
+            f"{args.robot_id} stack sequence: {args.stack_target} -> lift up -> wait -> "
+            f"{args.shelf_storage_target} -> stop -> {args.unload_target} -> lift down -> "
+            f"{args.wait_target}; "
+            f"pose_source={args.pose_source}; peer={args.peer_robot_id}; "
+            f"avoidance_role={args.avoidance_role}; reservation_priority={args.reservation_priority}"
         )
 
     def _on_odom(self, msg: Odometry) -> None:
@@ -115,7 +166,31 @@ class Robot1StackSequence(Node):
                 self._set_pose(self.tf_pose, "tf")
                 return
 
+    def _on_peer_odom(self, msg: Odometry) -> None:
+        self.peer_odom_pose = _pose_from_odom(msg)
+        if self.args.peer_pose_source == "odom" or (
+            self.args.peer_pose_source == "auto" and self.peer_pose_source != "tf"
+        ):
+            self.peer_pose = self.peer_odom_pose
+            self.peer_pose_source = "odom"
+
+    def _on_peer_tf(self, msg: TFMessage) -> None:
+        if self.args.peer_pose_source not in {"tf", "auto"}:
+            return
+        for transform in msg.transforms:
+            if _is_world_to_robot_base(transform, self.args.peer_base_frame):
+                self.peer_tf_pose = _pose_from_transform(transform)
+                self.peer_pose = self.peer_tf_pose
+                self.peer_pose_source = "tf"
+                return
+
+    def _on_peer_reservation(self, msg: String) -> None:
+        reservation = _parse_reservation_status(msg.data, received_at=self._now())
+        if reservation is not None and reservation.robot_id != self.args.robot_id:
+            self.peer_reservation = reservation
+
     def _set_pose(self, pose: Pose2D, source: str) -> None:
+        self.center_pose = pose
         self.pose = _offset_pose(
             pose,
             offset_x=self.args.tracking_offset_x,
@@ -124,13 +199,14 @@ class Robot1StackSequence(Node):
         self.pose_source = source
 
     def _on_timer(self) -> None:
+        self._publish_reservation_status()
         if self.pose is None:
             self._publish_stop()
             self._publish_status("waiting for odom")
             return
 
         if self.phase == SequencePhase.MOVE_TO_STACK:
-            if self._step_move("STACK"):
+            if self._step_move(self.args.stack_target):
                 self._change_phase(SequencePhase.LIFT_UP)
             return
 
@@ -151,7 +227,7 @@ class Robot1StackSequence(Node):
 
         if self.phase == SequencePhase.MOVE_TO_SHELF_STORAGE:
             self._publish_lift(self.args.lift_up_position)
-            if self._step_move("SHELF_STORAGE"):
+            if self._step_move(self.args.shelf_storage_target):
                 self._change_phase(SequencePhase.STOP_AT_SHELF_STORAGE)
             return
 
@@ -166,17 +242,51 @@ class Robot1StackSequence(Node):
 
         if self.phase == SequencePhase.MOVE_TO_UNLOAD_1:
             self._publish_lift(self.args.lift_up_position)
-            if self._step_move("UNLOAD_1"):
+            if self._step_move(self.args.unload_target):
+                self._change_phase(SequencePhase.SETTLE_AT_UNLOAD)
+            return
+
+        if self.phase == SequencePhase.SETTLE_AT_UNLOAD:
+            self._publish_stop()
+            self._publish_lift(self.args.lift_up_position)
+            if self._elapsed() >= self.args.unload_settle_duration:
                 self._change_phase(SequencePhase.LIFT_DOWN)
+            else:
+                self._publish_status(
+                    f"phase={self.phase.value}; settling={self._elapsed():.2f}; "
+                    f"lift={self.args.lift_up_position:.3f}"
+                )
             return
 
         if self.phase == SequencePhase.LIFT_DOWN:
             self._publish_stop()
             self._publish_lift(self.args.lift_down_position)
             if self._elapsed() >= self.args.lift_down_hold:
-                self._change_phase(SequencePhase.COMPLETE)
+                self._change_phase(SequencePhase.BACK_OUT_FROM_UNLOAD)
             else:
-                self._publish_status(f"phase={self.phase.value}; lowering={self._elapsed():.2f}")
+                self._publish_status(
+                    f"phase={self.phase.value}; lowering={self._elapsed():.2f}; "
+                    f"lift={self.args.lift_down_position:.3f}"
+                )
+            return
+
+        if self.phase == SequencePhase.BACK_OUT_FROM_UNLOAD:
+            self._publish_lift(self.args.lift_down_position)
+            if self._elapsed() >= self.args.back_out_duration:
+                self._publish_stop()
+                self._change_phase(SequencePhase.MOVE_TO_WAIT_1)
+            else:
+                self._publish_command(-abs(self.args.back_out_speed), 0.0)
+                self._publish_status(
+                    f"phase={self.phase.value}; backing={self._elapsed():.2f}; "
+                    f"speed={-abs(self.args.back_out_speed):.3f}"
+                )
+            return
+
+        if self.phase == SequencePhase.MOVE_TO_WAIT_1:
+            self._publish_lift(self.args.lift_down_position)
+            if self._step_move(self.args.wait_target):
+                self._change_phase(SequencePhase.COMPLETE)
             return
 
         self._publish_stop()
@@ -187,11 +297,20 @@ class Robot1StackSequence(Node):
         if self.move_state.target_name != target_name:
             self.move_state = MoveState(target_name)
 
+        safety_wait_reason = self._peer_safety_wait_reason()
+        if safety_wait_reason:
+            self._publish_stop()
+            self._publish_status(
+                f"phase={self.phase.value}; target={target_name}; peer_safety_wait={safety_wait_reason}"
+            )
+            return False
+
         if self.move_state.route is None:
-            self.move_state.route = build_axis_route(
-                (self.pose.x, self.pose.y),
+            route_start_pose = self._pose_for_route_start(target_name)
+            self.move_state.route = _build_route_for_sequence_target(
+                (route_start_pose.x, route_start_pose.y),
                 target_name,
-                axis_order=self._axis_order_for_target(target_name),
+                self.args,
             )
             self.get_logger().info(
                 f"Route to {self.move_state.route.target_name}: "
@@ -210,13 +329,42 @@ class Robot1StackSequence(Node):
             self._publish_status(f"phase={self.phase.value}; target={target_name}; done=True")
             return True
 
+        reservation_wait_reason = self._reservation_wait_reason(target_name)
+        if reservation_wait_reason:
+            self._publish_stop()
+            self._publish_status(
+                f"phase={self.phase.value}; target={target_name}; reservation_wait={reservation_wait_reason}"
+            )
+            return False
+
+        grid_wait_reason = self._grid_reservation_wait_reason()
+        if grid_wait_reason:
+            self._publish_stop()
+            self._publish_status(
+                f"phase={self.phase.value}; target={target_name}; grid_reservation_wait={grid_wait_reason}"
+            )
+            return False
+
         if self.move_state.segment_start_pose is None:
             self.move_state.segment_start_pose = self.pose
 
         target = self.move_state.route.waypoints[self.move_state.waypoint_index]
         active_axis = self.move_state.route.axes[self.move_state.waypoint_index]
+        control_pose = self._pose_for_segment(target_name, active_axis)
+        avoidance_action = self._maybe_handle_peer_head_on(target_name, target, active_axis, control_pose)
+        if avoidance_action == "yield":
+            return False
+        if avoidance_action == "reroute":
+            self.move_state.segment_start_pose = control_pose
+            target = self.move_state.route.waypoints[self.move_state.waypoint_index]
+            active_axis = self.move_state.route.axes[self.move_state.waypoint_index]
+            control_pose = self._pose_for_segment(target_name, active_axis)
+        if self._should_pre_align_before_approach(target_name):
+            if not self._step_pre_align(target_name, target, active_axis, control_pose):
+                return False
+
         command = compute_axis_nav_command(
-            self.pose,
+            control_pose,
             target,
             segment_start=(
                 self.move_state.segment_start_pose.x,
@@ -229,6 +377,8 @@ class Robot1StackSequence(Node):
             yaw_tolerance=self.args.yaw_tolerance,
             yaw_offset=self.args.yaw_offset,
             angular_sign=self.args.angular_sign,
+            allow_crossed_axis_target=self._allow_crossed_axis_target(target_name, active_axis),
+            axis_aligned_heading=self._use_axis_aligned_heading(target_name, active_axis),
         )
         self._publish_command(command.linear_x, command.angular_z)
         self._publish_status(
@@ -238,7 +388,8 @@ class Robot1StackSequence(Node):
             f"odom_y={_format_pose_value(self.odom_pose, 'y')}; "
             f"tf_x={_format_pose_value(self.tf_pose, 'x')}; "
             f"tf_y={_format_pose_value(self.tf_pose, 'y')}; source={self.pose_source}; "
-            f"track_x={self.pose.x:.3f}; track_y={self.pose.y:.3f}; axis={active_axis}; "
+            f"track_x={self.pose.x:.3f}; track_y={self.pose.y:.3f}; "
+            f"control_x={control_pose.x:.3f}; control_y={control_pose.y:.3f}; axis={active_axis}; "
             f"goal=({target[0]:.3f},{target[1]:.3f}); "
             f"axis_error={command.axis_error:.3f}; tolerance="
             f"{self._distance_tolerance_for_segment(target_name, active_axis):.3f}; "
@@ -253,25 +404,298 @@ class Robot1StackSequence(Node):
             self.move_state.segment_start_pose = None
         return False
 
-    def _axis_order_for_target(self, target_name: str) -> str:
-        if target_name == "STACK":
-            return self.args.stack_axis_order
-        return self.args.axis_order
+    def _peer_safety_wait_reason(self) -> str:
+        if not self.args.enable_peer_safety_stop or self.peer_pose is None or self.pose is None:
+            self.peer_safety_paused = False
+            return ""
+
+        distance = math.hypot(self.pose.x - self.peer_pose.x, self.pose.y - self.peer_pose.y)
+        if self.peer_safety_paused:
+            if distance >= self.args.peer_safety_resume_distance:
+                self.peer_safety_paused = False
+                return ""
+            return (
+                f"peer={self.args.peer_robot_id} distance={distance:.3f} "
+                f"resume={self.args.peer_safety_resume_distance:.3f}"
+            )
+
+        if distance <= self.args.peer_safety_stop_distance:
+            wait_reason = self._peer_safety_priority_wait_reason()
+            if not wait_reason:
+                return ""
+            self.peer_safety_paused = True
+            return (
+                f"peer={self.args.peer_robot_id} distance={distance:.3f} "
+                f"stop={self.args.peer_safety_stop_distance:.3f} reason={wait_reason}"
+            )
+        return ""
+
+    def _peer_safety_priority_wait_reason(self) -> str:
+        if self.pose is None:
+            return ""
+        current_cell = _world_to_grid_cell(
+            self.pose.x,
+            self.pose.y,
+            cell_size=self.args.grid_cell_size,
+            origin_x=self.args.grid_origin_x,
+            origin_y=self.args.grid_origin_y,
+        )
+        next_cell = _next_grid_cell(
+            current_cell,
+            self.pose,
+            self.move_state.route,
+            self.move_state.waypoint_index,
+            cell_size=self.args.grid_cell_size,
+            origin_x=self.args.grid_origin_x,
+            origin_y=self.args.grid_origin_y,
+        )
+        if self.peer_reservation is not None and self.peer_reservation.active:
+            reason = _grid_reservation_conflict_reason(
+                robot_id=self.args.robot_id,
+                priority=self.args.reservation_priority,
+                current_cell=current_cell,
+                next_cell=next_cell,
+                peer=self.peer_reservation,
+            )
+            if reason:
+                return reason
+            if self.peer_reservation.cell is not None or self.peer_reservation.next_cell is not None:
+                return ""
+
+        if _reservation_has_priority(
+            self.args.robot_id,
+            self.args.reservation_priority,
+            self.args.peer_robot_id,
+            self.args.peer_reservation_priority,
+        ):
+            return ""
+        return f"peer={self.args.peer_robot_id} priority={self.args.peer_reservation_priority}"
+
+    def _reservation_wait_reason(self, target_name: str) -> str:
+        if not self.args.enable_place_reservation:
+            return ""
+        if not _is_reserved_place(target_name, self.args.reserved_place_prefixes):
+            return ""
+        if self.peer_reservation is None or not self.peer_reservation.active:
+            return ""
+        if self._now() - self.peer_reservation.received_at > self.args.peer_reservation_timeout:
+            return ""
+        if self.peer_reservation.target_name != target_name:
+            return ""
+        if _reservation_has_priority(
+            self.args.robot_id,
+            self.args.reservation_priority,
+            self.peer_reservation.robot_id,
+            self.peer_reservation.priority,
+        ):
+            return ""
+        return f"peer={self.peer_reservation.robot_id} target={target_name}"
+
+    def _grid_reservation_wait_reason(self) -> str:
+        if not self.args.enable_grid_reservation or self.pose is None:
+            return ""
+        if self.peer_reservation is None or not self.peer_reservation.active:
+            return ""
+        if self._now() - self.peer_reservation.received_at > self.args.peer_reservation_timeout:
+            return ""
+        if self.peer_reservation.cell is None and self.peer_reservation.next_cell is None:
+            return ""
+
+        current_cell = _world_to_grid_cell(
+            self.pose.x,
+            self.pose.y,
+            cell_size=self.args.grid_cell_size,
+            origin_x=self.args.grid_origin_x,
+            origin_y=self.args.grid_origin_y,
+        )
+        next_cell = _next_grid_cell(
+            current_cell,
+            self.pose,
+            self.move_state.route,
+            self.move_state.waypoint_index,
+            cell_size=self.args.grid_cell_size,
+            origin_x=self.args.grid_origin_x,
+            origin_y=self.args.grid_origin_y,
+        )
+
+        return _grid_reservation_conflict_reason(
+            robot_id=self.args.robot_id,
+            priority=self.args.reservation_priority,
+            current_cell=current_cell,
+            next_cell=next_cell,
+            peer=self.peer_reservation,
+        )
+
+    def _maybe_handle_peer_head_on(
+        self,
+        target_name: str,
+        target: tuple[float, float],
+        active_axis: str,
+        control_pose: Pose2D,
+    ) -> str:
+        if self.args.avoidance_role == "off" or self.peer_pose is None:
+            return ""
+        if not _is_peer_head_on_conflict(
+            control_pose,
+            self.peer_pose,
+            target,
+            active_axis,
+            lane_tolerance=self.args.peer_lane_tolerance,
+            trigger_distance=self.args.peer_avoidance_trigger_distance,
+            path_margin=self.args.peer_avoidance_path_margin,
+            peer_yaw_tolerance=self.args.peer_yaw_tolerance,
+        ):
+            return ""
+
+        distance = math.hypot(control_pose.x - self.peer_pose.x, control_pose.y - self.peer_pose.y)
+        if self.args.avoidance_role == "yield":
+            self._publish_stop()
+            self._publish_status(
+                f"phase={self.phase.value}; target={target_name}; peer_head_on=yield; "
+                f"peer={self.args.peer_robot_id}; distance={distance:.3f}; source={self.peer_pose_source}"
+            )
+            return "yield"
+
+        if self.move_state.avoidance_applied or self.move_state.route is None:
+            return ""
+
+        route = _build_left_bypass_route(
+            (control_pose.x, control_pose.y),
+            self.peer_pose,
+            self.move_state.route,
+            self.move_state.waypoint_index,
+            active_axis,
+            lateral_offset=self.args.peer_avoidance_lateral_offset,
+            pass_distance=self.args.peer_avoidance_pass_distance,
+        )
+        if route is None:
+            return ""
+
+        self.move_state.route = route
+        self.move_state.waypoint_index = 0
+        self.move_state.segment_start_pose = None
+        self.move_state.pre_aligned_waypoint_index = None
+        self.move_state.avoidance_applied = True
+        self.get_logger().info(
+            f"{self.args.robot_id} peer avoidance route: "
+            + " -> ".join(f"({x:.3f},{y:.3f})/{axis}" for (x, y), axis in zip(route.waypoints, route.axes))
+        )
+        self._publish_status(
+            f"phase={self.phase.value}; target={target_name}; peer_head_on=reroute; "
+            f"peer={self.args.peer_robot_id}; distance={distance:.3f}; source={self.peer_pose_source}"
+        )
+        return "reroute"
+
+    def _should_pre_align_before_approach(self, target_name: str) -> bool:
+        if self.move_state.route is None:
+            return False
+        return _should_pre_align_before_approach(
+            self.args,
+            target_name,
+            waypoint_index=self.move_state.waypoint_index,
+            waypoint_count=len(self.move_state.route.waypoints),
+            pre_aligned_waypoint_index=self.move_state.pre_aligned_waypoint_index,
+        )
+
+    def _step_pre_align(
+        self,
+        target_name: str,
+        target: tuple[float, float],
+        active_axis: str,
+        control_pose: Pose2D,
+    ) -> bool:
+        target_yaw = _target_yaw_for_segment(
+            control_pose,
+            target,
+            active_axis,
+            axis_aligned_heading=self._use_axis_aligned_heading(target_name, active_axis),
+        )
+        control_yaw = _normalize_angle(control_pose.yaw + self.args.yaw_offset)
+        yaw_error = _normalize_angle(target_yaw - control_yaw)
+        now = self._now()
+
+        derivative = 0.0
+        if (
+            self.move_state.last_pre_align_error is not None
+            and self.move_state.last_pre_align_time is not None
+        ):
+            dt = max(1e-3, now - self.move_state.last_pre_align_time)
+            derivative = _normalize_angle(yaw_error - self.move_state.last_pre_align_error) / dt
+
+        angular_z = (
+            self.args.stack_pre_align_kp * yaw_error
+            + self.args.stack_pre_align_kd * derivative
+        ) * self.args.angular_sign
+        angular_z = _clamp(
+            angular_z,
+            -self.args.stack_pre_align_turn_speed,
+            self.args.stack_pre_align_turn_speed,
+        )
+
+        self.move_state.last_pre_align_error = yaw_error
+        self.move_state.last_pre_align_time = now
+
+        if abs(yaw_error) <= self.args.stack_pre_align_yaw_tolerance:
+            self._publish_stop()
+            self.move_state.pre_aligned_waypoint_index = self.move_state.waypoint_index
+            self.move_state.last_pre_align_error = None
+            self.move_state.last_pre_align_time = None
+            self._publish_status(
+                f"phase={self.phase.value}; target={target_name}; pre_align=complete; "
+                f"target_yaw={target_yaw:.3f}; control_yaw={control_yaw:.3f}; "
+                f"yaw_error={yaw_error:.3f}"
+            )
+            return True
+
+        self._publish_command(0.0, angular_z)
+        self._publish_status(
+            f"phase={self.phase.value}; target={target_name}; pre_align=turning; "
+            f"control_x={control_pose.x:.3f}; control_y={control_pose.y:.3f}; "
+            f"goal=({target[0]:.3f},{target[1]:.3f}); "
+            f"target_yaw={target_yaw:.3f}; control_yaw={control_yaw:.3f}; "
+            f"yaw_error={yaw_error:.3f}; yaw_d={derivative:.3f}; angular={angular_z:.3f}"
+        )
+        return False
 
     def _speed_for_segment(self, target_name: str, active_axis: str) -> float:
-        if target_name == "STACK" and active_axis == "x":
+        final_waypoint_index = 0
+        if self.move_state.route is not None:
+            final_waypoint_index = len(self.move_state.route.waypoints) - 1
+        if (
+            target_name == self.args.stack_target
+            and active_axis == "x"
+            and self.move_state.waypoint_index == final_waypoint_index
+        ):
             return self.args.stack_approach_speed
         return self.args.speed
 
     def _distance_tolerance_for_segment(self, target_name: str, active_axis: str) -> float:
-        if target_name == "STACK" and active_axis == "y":
+        if target_name == self.args.stack_target and active_axis == "y":
             return self.args.stack_lateral_tolerance
         return self.args.distance_tolerance
+
+    def _allow_crossed_axis_target(self, target_name: str, active_axis: str) -> bool:
+        if self.move_state.avoidance_applied and self.move_state.waypoint_index <= 2:
+            return False
+        return not (target_name == self.args.stack_target and active_axis == "y")
+
+    def _use_axis_aligned_heading(self, target_name: str, active_axis: str) -> bool:
+        return not (target_name == self.args.stack_target and active_axis == "x")
+
+    def _pose_for_route_start(self, target_name: str) -> Pose2D:
+        if target_name == self.args.stack_target and self.center_pose is not None:
+            return self.center_pose
+        return self.pose
+
+    def _pose_for_segment(self, target_name: str, active_axis: str) -> Pose2D:
+        if target_name == self.args.stack_target and active_axis == "y" and self.center_pose is not None:
+            return self.center_pose
+        return self.pose
 
     def _change_phase(self, phase: SequencePhase) -> None:
         self.phase = phase
         self.phase_started_at = self._now()
-        self.move_state = MoveState(_target_for_phase(phase))
+        self.move_state = MoveState(_target_for_phase(phase, self.args))
         self._publish_status(f"phase={self.phase.value}")
 
     def _elapsed(self) -> float:
@@ -281,6 +705,20 @@ class Robot1StackSequence(Node):
         return self.get_clock().now().nanoseconds / 1e9
 
     def _publish_command(self, linear_x: float, angular_z: float) -> None:
+        now = self._now()
+        linear_x, angular_z = _limit_command_acceleration(
+            linear_x,
+            angular_z,
+            previous_linear_x=self.last_command_linear_x,
+            previous_angular_z=self.last_command_angular_z,
+            dt=0.0 if self.last_command_time is None else now - self.last_command_time,
+            linear_accel_limit=self.args.linear_accel_limit,
+            angular_accel_limit=self.args.angular_accel_limit,
+        )
+        self.last_command_linear_x = linear_x
+        self.last_command_angular_z = angular_z
+        self.last_command_time = now
+
         command = Twist()
         command.linear.x = linear_x
         command.angular.z = angular_z
@@ -300,6 +738,38 @@ class Robot1StackSequence(Node):
         msg.data = text
         self.status_pub.publish(msg)
 
+    def _publish_reservation_status(self) -> None:
+        msg = String()
+        cell = None
+        next_cell = None
+        if self.pose is not None:
+            cell = _world_to_grid_cell(
+                self.pose.x,
+                self.pose.y,
+                cell_size=self.args.grid_cell_size,
+                origin_x=self.args.grid_origin_x,
+                origin_y=self.args.grid_origin_y,
+            )
+            next_cell = _next_grid_cell(
+                cell,
+                self.pose,
+                self.move_state.route,
+                self.move_state.waypoint_index,
+                cell_size=self.args.grid_cell_size,
+                origin_x=self.args.grid_origin_x,
+                origin_y=self.args.grid_origin_y,
+            )
+        msg.data = _format_reservation_status(
+            robot_id=self.args.robot_id,
+            phase=self.phase.value,
+            target_name=_target_for_phase(self.phase, self.args),
+            priority=self.args.reservation_priority,
+            active=self.phase != SequencePhase.COMPLETE,
+            cell=cell,
+            next_cell=next_cell,
+        )
+        self.reservation_pub.publish(msg)
+
     def _try_publish_stop(self) -> None:
         try:
             self._publish_stop()
@@ -307,14 +777,278 @@ class Robot1StackSequence(Node):
             self.get_logger().debug(f"Stop publish skipped during shutdown: {exc}")
 
 
-def _target_for_phase(phase: SequencePhase) -> str:
-    if phase == SequencePhase.MOVE_TO_STACK:
-        return "STACK"
-    if phase == SequencePhase.MOVE_TO_SHELF_STORAGE:
-        return "SHELF_STORAGE"
-    if phase == SequencePhase.MOVE_TO_UNLOAD_1:
-        return "UNLOAD_1"
+def _target_for_phase(phase: SequencePhase, args: argparse.Namespace | None = None) -> str:
+    if phase in {
+        SequencePhase.MOVE_TO_STACK,
+        SequencePhase.LIFT_UP,
+        SequencePhase.WAIT_AFTER_LIFT,
+    }:
+        return getattr(args, "stack_target", "STACK_1")
+    if phase in {SequencePhase.MOVE_TO_SHELF_STORAGE, SequencePhase.STOP_AT_SHELF_STORAGE}:
+        return getattr(args, "shelf_storage_target", "SHELF_STORAGE_1")
+    if phase in {
+        SequencePhase.MOVE_TO_UNLOAD_1,
+        SequencePhase.SETTLE_AT_UNLOAD,
+        SequencePhase.LIFT_DOWN,
+        SequencePhase.BACK_OUT_FROM_UNLOAD,
+    }:
+        return getattr(args, "unload_target", "UNLOAD_1")
+    if phase == SequencePhase.MOVE_TO_WAIT_1:
+        return getattr(args, "wait_target", "WAIT_1")
     return ""
+
+
+def _build_route_for_sequence_target(
+    start: tuple[float, float],
+    target_name: str,
+    args: argparse.Namespace,
+) -> AxisRoute:
+    if target_name == args.stack_target and args.stack_y_align_x_offset > 0.0:
+        target = PLACES[target_name]
+        approach_direction = target[0] - start[0]
+        if math.isclose(approach_direction, 0.0, abs_tol=1e-6):
+            pre_align_x = target[0] + args.stack_y_align_x_offset
+        else:
+            pre_align_x = target[0] - math.copysign(
+                args.stack_y_align_x_offset,
+                approach_direction,
+            )
+        waypoints, axes = _deduplicate_route_steps(
+            start,
+            [
+                ((pre_align_x, start[1]), "x"),
+                ((pre_align_x, target[1]), "y"),
+                (target, "x"),
+            ],
+        )
+        return AxisRoute(target_name=target_name, waypoints=waypoints, axes=axes)
+
+    return build_axis_route(
+        start,
+        target_name,
+        axis_order=_axis_order_for_sequence_target(target_name, args),
+    )
+
+
+def _axis_order_for_sequence_target(target_name: str, args: argparse.Namespace) -> str:
+    if target_name == args.stack_target:
+        return args.stack_axis_order
+    if target_name == args.unload_target:
+        return args.unload_axis_order
+    if target_name == args.wait_target:
+        return args.wait_axis_order
+    return args.axis_order
+
+
+def _deduplicate_route_steps(
+    start: tuple[float, float],
+    steps: list[tuple[tuple[float, float], str]],
+) -> tuple[list[tuple[float, float]], list[str]]:
+    waypoints = []
+    axes = []
+    previous = start
+    for point, axis in steps:
+        if not (
+            math.isclose(previous[0], point[0], abs_tol=1e-3)
+            and math.isclose(previous[1], point[1], abs_tol=1e-3)
+        ):
+            waypoints.append(point)
+            axes.append(axis)
+            previous = point
+    return waypoints, axes
+
+
+def _axis_error(pose: Pose2D, target: tuple[float, float], active_axis: str) -> float:
+    if active_axis == "x":
+        return target[0] - pose.x
+    return target[1] - pose.y
+
+
+def _axis_target_yaw(axis_error: float, active_axis: str) -> float:
+    if active_axis == "x":
+        return 0.0 if axis_error >= 0.0 else math.pi
+    return math.pi / 2.0 if axis_error >= 0.0 else -math.pi / 2.0
+
+
+def _target_yaw_for_segment(
+    pose: Pose2D,
+    target: tuple[float, float],
+    active_axis: str,
+    *,
+    axis_aligned_heading: bool,
+) -> float:
+    if axis_aligned_heading:
+        return _axis_target_yaw(_axis_error(pose, target, active_axis), active_axis)
+    return math.atan2(target[1] - pose.y, target[0] - pose.x)
+
+
+def _should_pre_align_before_approach(
+    args: argparse.Namespace,
+    target_name: str,
+    *,
+    waypoint_index: int,
+    waypoint_count: int,
+    pre_aligned_waypoint_index: int | None,
+) -> bool:
+    if waypoint_count <= 0 or pre_aligned_waypoint_index == waypoint_index:
+        return False
+    if target_name == args.stack_target:
+        return args.stack_pre_align
+    if target_name == args.unload_target and waypoint_index == waypoint_count - 1:
+        return args.unload_pre_align
+    return False
+
+
+def _is_peer_head_on_conflict(
+    pose: Pose2D,
+    peer_pose: Pose2D,
+    target: tuple[float, float],
+    active_axis: str,
+    *,
+    lane_tolerance: float,
+    trigger_distance: float,
+    path_margin: float,
+    peer_yaw_tolerance: float,
+) -> bool:
+    direction = _direction_to_target(pose, target, active_axis)
+    if direction == 0.0:
+        return False
+    if _lateral_distance(pose, peer_pose, active_axis) > lane_tolerance:
+        return False
+    peer_axis_distance = _axis_distance(pose, peer_pose, active_axis) * direction
+    target_axis_distance = abs(_axis_point_value(target, active_axis) - _axis_value(pose, active_axis))
+    if peer_axis_distance <= 0.0:
+        return False
+    if peer_axis_distance > target_axis_distance + max(0.0, path_margin):
+        return False
+    distance = math.hypot(pose.x - peer_pose.x, pose.y - peer_pose.y)
+    if trigger_distance > 0.0 and distance > trigger_distance:
+        return False
+
+    peer_expected_yaw = _axis_target_yaw(-direction, active_axis)
+    peer_yaw_error = abs(_normalize_angle(peer_expected_yaw - peer_pose.yaw))
+    return peer_yaw_error <= peer_yaw_tolerance
+
+
+def _build_left_bypass_route(
+    start: tuple[float, float],
+    peer_pose: Pose2D,
+    route: AxisRoute,
+    waypoint_index: int,
+    active_axis: str,
+    *,
+    lateral_offset: float,
+    pass_distance: float,
+) -> AxisRoute | None:
+    if waypoint_index >= len(route.waypoints):
+        return None
+    original_target = route.waypoints[waypoint_index]
+    direction = _direction_from_start_to_target(start, original_target, active_axis)
+    if direction == 0.0:
+        return None
+
+    offset = _left_offset(active_axis, direction, lateral_offset)
+    pass_axis_value = _axis_value(peer_pose, active_axis) + direction * pass_distance
+    side_point = _offset_point_on_current_axis(start, original_target, active_axis, offset)
+    pass_side_point = _replace_axis_value(side_point, active_axis, pass_axis_value)
+    pass_lane_point = _replace_lateral_value(
+        pass_side_point,
+        active_axis,
+        _lateral_point_value(original_target, active_axis),
+    )
+
+    old_points = route.waypoints[waypoint_index:]
+    old_axes = route.axes[waypoint_index:]
+    waypoints, axes = _deduplicate_route_steps(
+        start,
+        [
+            (side_point, _perpendicular_axis(active_axis)),
+            (pass_side_point, active_axis),
+            (pass_lane_point, _perpendicular_axis(active_axis)),
+            *zip(old_points, old_axes),
+        ],
+    )
+    return AxisRoute(target_name=route.target_name, waypoints=waypoints, axes=axes)
+
+
+def _direction_to_target(pose: Pose2D, target: tuple[float, float], active_axis: str) -> float:
+    return _direction_from_start_to_target((pose.x, pose.y), target, active_axis)
+
+
+def _direction_from_start_to_target(
+    start: tuple[float, float],
+    target: tuple[float, float],
+    active_axis: str,
+) -> float:
+    delta = _axis_point_value(target, active_axis) - _axis_point_value(start, active_axis)
+    if math.isclose(delta, 0.0, abs_tol=1e-6):
+        return 0.0
+    return math.copysign(1.0, delta)
+
+
+def _axis_value(pose: Pose2D, active_axis: str) -> float:
+    return pose.x if active_axis == "x" else pose.y
+
+
+def _axis_point_value(point: tuple[float, float], active_axis: str) -> float:
+    return point[0] if active_axis == "x" else point[1]
+
+
+def _lateral_point_value(point: tuple[float, float], active_axis: str) -> float:
+    return point[1] if active_axis == "x" else point[0]
+
+
+def _axis_distance(left: Pose2D, right: Pose2D, active_axis: str) -> float:
+    if active_axis == "x":
+        return right.x - left.x
+    return right.y - left.y
+
+
+def _lateral_distance(left: Pose2D, right: Pose2D, active_axis: str) -> float:
+    if active_axis == "x":
+        return abs(left.y - right.y)
+    return abs(left.x - right.x)
+
+
+def _perpendicular_axis(active_axis: str) -> str:
+    return "y" if active_axis == "x" else "x"
+
+
+def _left_offset(active_axis: str, direction: float, lateral_offset: float) -> float:
+    if active_axis == "x":
+        return math.copysign(abs(lateral_offset), direction)
+    return math.copysign(abs(lateral_offset), -direction)
+
+
+def _offset_point_on_current_axis(
+    start: tuple[float, float],
+    original_target: tuple[float, float],
+    active_axis: str,
+    offset: float,
+) -> tuple[float, float]:
+    if active_axis == "x":
+        return (start[0], original_target[1] + offset)
+    return (original_target[0] + offset, start[1])
+
+
+def _replace_axis_value(
+    point: tuple[float, float],
+    active_axis: str,
+    axis_value: float,
+) -> tuple[float, float]:
+    if active_axis == "x":
+        return (axis_value, point[1])
+    return (point[0], axis_value)
+
+
+def _replace_lateral_value(
+    point: tuple[float, float],
+    active_axis: str,
+    lateral_value: float,
+) -> tuple[float, float]:
+    if active_axis == "x":
+        return (point[0], lateral_value)
+    return (lateral_value, point[1])
 
 
 def _pose_from_odom(msg: Odometry) -> Pose2D:
@@ -366,23 +1100,261 @@ def _offset_pose(pose: Pose2D, *, offset_x: float, offset_y: float) -> Pose2D:
     )
 
 
-def _parse_args(args: Optional[list[str]] = None) -> argparse.Namespace:
-    robot_id = default_robot_id(1)
-    parser = argparse.ArgumentParser(
-        description="Run robot1 through stack pickup, shelf stop, and unload dropoff."
+def _normalize_angle(angle: float) -> float:
+    while angle > math.pi:
+        angle -= 2.0 * math.pi
+    while angle < -math.pi:
+        angle += 2.0 * math.pi
+    return angle
+
+
+def _clamp(value: float, low: float, high: float) -> float:
+    return max(low, min(high, value))
+
+
+def _limit_command_acceleration(
+    linear_x: float,
+    angular_z: float,
+    *,
+    previous_linear_x: float | None,
+    previous_angular_z: float | None,
+    dt: float,
+    linear_accel_limit: float,
+    angular_accel_limit: float,
+) -> tuple[float, float]:
+    if previous_linear_x is None or previous_angular_z is None or dt <= 0.0:
+        return linear_x, angular_z
+    return (
+        _slew_rate_limit(linear_x, previous_linear_x, linear_accel_limit, dt),
+        _slew_rate_limit(angular_z, previous_angular_z, angular_accel_limit, dt),
     )
-    parser.add_argument("--odom-topic", default=default_odom_topic(1))
+
+
+def _slew_rate_limit(target: float, previous: float, rate_limit: float, dt: float) -> float:
+    if rate_limit <= 0.0:
+        return target
+    max_delta = rate_limit * dt
+    return previous + _clamp(target - previous, -max_delta, max_delta)
+
+
+def _format_reservation_status(
+    *,
+    robot_id: str,
+    phase: str,
+    target_name: str,
+    priority: int,
+    active: bool,
+    cell: tuple[int, int] | None = None,
+    next_cell: tuple[int, int] | None = None,
+) -> str:
+    active_text = "1" if active else "0"
+    text = (
+        f"robot={robot_id};phase={phase};target={target_name};"
+        f"priority={priority};active={active_text}"
+    )
+    if cell is not None:
+        text += f";cell={cell[0]},{cell[1]}"
+    if next_cell is not None:
+        text += f";next={next_cell[0]},{next_cell[1]}"
+    return text
+
+
+def _parse_reservation_status(text: str, *, received_at: float) -> PeerReservationState | None:
+    fields = {}
+    for part in text.split(";"):
+        if "=" not in part:
+            continue
+        key, value = part.split("=", 1)
+        fields[key.strip()] = value.strip()
+    if not {"robot", "phase", "target", "priority", "active"} <= fields.keys():
+        return None
+    try:
+        priority = int(fields["priority"])
+    except ValueError:
+        return None
+    cell = _parse_grid_cell(fields.get("cell", ""))
+    next_cell = _parse_grid_cell(fields.get("next", ""))
+    return PeerReservationState(
+        robot_id=fields["robot"],
+        phase=fields["phase"],
+        target_name=fields["target"],
+        priority=priority,
+        active=fields["active"] in {"1", "true", "True", "active"},
+        received_at=received_at,
+        cell=cell,
+        next_cell=next_cell,
+    )
+
+
+def _parse_grid_cell(text: str) -> tuple[int, int] | None:
+    if not text:
+        return None
+    parts = text.split(",", 1)
+    if len(parts) != 2:
+        return None
+    try:
+        return int(parts[0]), int(parts[1])
+    except ValueError:
+        return None
+
+
+def _world_to_grid_cell(
+    x: float,
+    y: float,
+    *,
+    cell_size: float,
+    origin_x: float,
+    origin_y: float,
+) -> tuple[int, int]:
+    if cell_size <= 0.0:
+        raise ValueError("cell_size must be positive")
+    return (
+        math.floor((x - origin_x) / cell_size),
+        math.floor((y - origin_y) / cell_size),
+    )
+
+
+def _next_grid_cell(
+    current_cell: tuple[int, int],
+    pose: Pose2D,
+    route: AxisRoute | None,
+    waypoint_index: int,
+    *,
+    cell_size: float,
+    origin_x: float,
+    origin_y: float,
+) -> tuple[int, int]:
+    if route is None or waypoint_index >= len(route.waypoints):
+        return current_cell
+    target = route.waypoints[waypoint_index]
+    active_axis = route.axes[waypoint_index]
+    target_cell = _world_to_grid_cell(
+        target[0],
+        target[1],
+        cell_size=cell_size,
+        origin_x=origin_x,
+        origin_y=origin_y,
+    )
+    if target_cell == current_cell:
+        return current_cell
+
+    current_x, current_y = current_cell
+    if active_axis == "x":
+        direction = 1 if target_cell[0] > current_x else -1
+        return current_x + direction, current_y
+    direction = 1 if target_cell[1] > current_y else -1
+    return current_x, current_y + direction
+
+
+def _grid_reservation_conflict_reason(
+    *,
+    robot_id: str,
+    priority: int,
+    current_cell: tuple[int, int],
+    next_cell: tuple[int, int],
+    peer: PeerReservationState,
+) -> str:
+    peer_cell = peer.cell
+    peer_next = peer.next_cell
+    has_priority = _reservation_has_priority(robot_id, priority, peer.robot_id, peer.priority)
+
+    if peer_next == current_cell and peer_cell == next_cell:
+        if has_priority:
+            return ""
+        return f"peer={peer.robot_id} edge_swap={current_cell}->{next_cell}"
+    if peer_cell == next_cell:
+        return f"peer={peer.robot_id} occupies_next={next_cell}"
+    if peer_next == next_cell and not has_priority:
+        return f"peer={peer.robot_id} reserves_next={next_cell}"
+    return ""
+
+
+def _is_reserved_place(target_name: str, prefixes: str) -> bool:
+    target = target_name.upper()
+    return any(
+        target == prefix or target.startswith(f"{prefix}_")
+        for prefix in _parse_reserved_place_prefixes(prefixes)
+    )
+
+
+def _parse_reserved_place_prefixes(prefixes: str) -> list[str]:
+    return [prefix.strip().upper() for prefix in prefixes.split(",") if prefix.strip()]
+
+
+def _reservation_has_priority(
+    robot_id: str,
+    priority: int,
+    peer_robot_id: str,
+    peer_priority: int,
+) -> bool:
+    if priority != peer_priority:
+        return priority < peer_priority
+    return robot_id <= peer_robot_id
+
+
+def _parse_args(
+    args: Optional[list[str]] = None,
+    *,
+    default_robot_index: int = 1,
+    default_stack_target: str = "STACK_1",
+    default_shelf_storage_target: str = "SHELF_STORAGE_1",
+    default_unload_target: str = "UNLOAD_1",
+    default_wait_target: str = "WAIT_1",
+    default_status_topic: str | None = None,
+) -> argparse.Namespace:
+    robot_id = default_robot_id(default_robot_index)
+    default_peer_index = 2 if default_robot_index == 1 else 1
+    default_peer_id = default_robot_id(default_peer_index)
+    default_avoidance_role = "yield" if default_robot_index == 1 else "evade"
+    default_reservation_priority = default_robot_index
+    stack_targets = sorted(name for name in PLACES if name.startswith("STACK_"))
+    shelf_storage_targets = sorted(name for name in PLACES if name.startswith("SHELF_STORAGE_"))
+    unload_targets = sorted(name for name in PLACES if name.startswith("UNLOAD_"))
+    parser = argparse.ArgumentParser(
+        description="Run a robot through stack pickup, shelf stop, unload dropoff, and wait."
+    )
+    parser.add_argument("--robot-id", default=robot_id)
+    parser.add_argument("--odom-topic", default=default_odom_topic(default_robot_index))
     parser.add_argument("--tf-topic", default=f"/{robot_id}/tf")
-    parser.add_argument("--base-frame", default=default_base_frame(1))
+    parser.add_argument("--base-frame", default=default_base_frame(default_robot_index))
+    parser.add_argument("--peer-robot-id", default=default_peer_id)
+    parser.add_argument("--peer-odom-topic", default=default_odom_topic(default_peer_index))
+    parser.add_argument("--peer-tf-topic", default=f"/{default_peer_id}/tf")
+    parser.add_argument("--peer-base-frame", default=default_base_frame(default_peer_index))
+    parser.add_argument(
+        "--peer-pose-source",
+        choices=["tf", "odom", "auto"],
+        default="tf",
+        help="Use this source for the other robot pose used by local avoidance.",
+    )
     parser.add_argument(
         "--pose-source",
         choices=["tf", "odom", "auto"],
         default="tf",
         help="Use tf for world poses, odom for robot-local odometry, or auto with tf overriding odom.",
     )
-    parser.add_argument("--cmd-vel-topic", default=default_cmd_vel_topic(1))
+    parser.add_argument("--cmd-vel-topic", default=default_cmd_vel_topic(default_robot_index))
     parser.add_argument("--lift-topic", default=f"/{robot_id}/lift_cmd")
-    parser.add_argument("--status-topic", default="/smart_factory/robot1_stack_sequence_status")
+    parser.add_argument(
+        "--status-topic",
+        default=default_status_topic
+        or f"/smart_factory/robot{default_robot_index}_stack_sequence_status",
+    )
+    parser.add_argument(
+        "--reservation-topic",
+        default=f"/smart_factory/robot{default_robot_index}_stack_reservation",
+    )
+    parser.add_argument(
+        "--peer-reservation-topic",
+        default=f"/smart_factory/robot{default_peer_index}_stack_reservation",
+    )
+    parser.add_argument("--stack-target", choices=stack_targets, default=default_stack_target)
+    parser.add_argument(
+        "--shelf-storage-target",
+        choices=shelf_storage_targets,
+        default=default_shelf_storage_target,
+    )
+    parser.add_argument("--unload-target", choices=unload_targets, default=default_unload_target)
     parser.add_argument("--axis-order", choices=["xy", "yx"], default="xy")
     parser.add_argument(
         "--stack-axis-order",
@@ -390,17 +1362,176 @@ def _parse_args(args: Optional[list[str]] = None) -> argparse.Namespace:
         default="yx",
         help="Use yx to align left/right before the final straight stack approach.",
     )
-    parser.add_argument("--speed", type=float, default=2.0)
+    parser.add_argument(
+        "--unload-axis-order",
+        choices=["xy", "yx"],
+        default="yx",
+        help="Use yx so UNLOAD_2 can be approached without passing through UNLOAD_1.",
+    )
+    parser.add_argument(
+        "--wait-axis-order",
+        choices=["xy", "yx"],
+        default="yx",
+        help="Use yx so the robot leaves unload by aligning y before moving to the wait x lane.",
+    )
+    parser.add_argument("--speed", type=float, default=3.0)
     parser.add_argument("--stack-approach-speed", type=float, default=0.5)
+    parser.add_argument(
+        "--linear-accel-limit",
+        type=float,
+        default=2.0,
+        help="Maximum linear.x command change in m/s^2. Use 0 to disable command ramping.",
+    )
+    parser.add_argument(
+        "--angular-accel-limit",
+        type=float,
+        default=3.0,
+        help="Maximum angular.z command change in rad/s^2. Use 0 to disable command ramping.",
+    )
+    parser.add_argument(
+        "--stack-y-align-x-offset",
+        type=float,
+        default=0.0,
+        help="Run stack lateral y alignment this many meters before the final stack x target; 0 keeps y-first routing.",
+    )
+    parser.add_argument(
+        "--stack-pre-align",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Stop and PD-align yaw before the final x-axis stack approach.",
+    )
+    parser.add_argument("--stack-pre-align-kp", type=float, default=1.2)
+    parser.add_argument("--stack-pre-align-kd", type=float, default=0.12)
+    parser.add_argument("--stack-pre-align-turn-speed", type=float, default=0.45)
+    parser.add_argument("--stack-pre-align-yaw-tolerance", type=float, default=0.035)
+    parser.add_argument(
+        "--unload-pre-align",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Stop and PD-align yaw before the final unload approach.",
+    )
     parser.add_argument(
         "--stack-lateral-tolerance",
         type=float,
-        default=0.005,
+        default=0.08,
         help="Y-axis tolerance used before the final stack approach.",
     )
-    parser.add_argument("--turn-speed", type=float, default=2.0)
+    parser.add_argument("--turn-speed", type=float, default=1.5)
     parser.add_argument("--distance-tolerance", type=float, default=0.12)
     parser.add_argument("--yaw-tolerance", type=float, default=0.2)
+    parser.add_argument(
+        "--enable-place-reservation",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Publish/subscribe simple place reservations and wait when a higher-priority peer owns the same target.",
+    )
+    parser.add_argument(
+        "--reservation-priority",
+        type=int,
+        default=default_reservation_priority,
+        help="Lower number wins when two robots reserve the same target.",
+    )
+    parser.add_argument(
+        "--peer-reservation-priority",
+        type=int,
+        default=default_peer_index,
+        help="Priority expected for the peer robot; lower number wins safety-stop tie decisions.",
+    )
+    parser.add_argument(
+        "--reserved-place-prefixes",
+        default="STACK,SHELF_STORAGE,UNLOAD",
+        help="Comma-separated target prefixes protected by place reservation.",
+    )
+    parser.add_argument(
+        "--peer-reservation-timeout",
+        type=float,
+        default=2.0,
+        help="Ignore peer reservation messages older than this many seconds.",
+    )
+    parser.add_argument(
+        "--enable-grid-reservation",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Reserve the robot's current grid cell and next grid cell using peer reservation messages.",
+    )
+    parser.add_argument(
+        "--grid-cell-size",
+        type=float,
+        default=1.0,
+        help="World meters per reservation grid cell.",
+    )
+    parser.add_argument(
+        "--grid-origin-x",
+        type=float,
+        default=0.0,
+        help="World x coordinate for grid cell (0,0) origin.",
+    )
+    parser.add_argument(
+        "--grid-origin-y",
+        type=float,
+        default=0.0,
+        help="World y coordinate for grid cell (0,0) origin.",
+    )
+    parser.add_argument(
+        "--enable-peer-safety-stop",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Pause this robot near a higher-priority peer until the peer is far enough away.",
+    )
+    parser.add_argument(
+        "--peer-safety-stop-distance",
+        type=float,
+        default=3.0,
+        help="Pause a lower-priority robot when the peer is at or below this distance.",
+    )
+    parser.add_argument(
+        "--peer-safety-resume-distance",
+        type=float,
+        default=5.0,
+        help="Resume a paused lower-priority robot after the peer is at or above this distance.",
+    )
+    parser.add_argument(
+        "--avoidance-role",
+        choices=["yield", "evade", "off"],
+        default=default_avoidance_role,
+        help="Local peer-pose avoidance behavior. Defaults to robot1 yielding and robot2 evading.",
+    )
+    parser.add_argument(
+        "--peer-lane-tolerance",
+        type=float,
+        default=0.35,
+        help="Lateral distance used to treat both robots as occupying the same lane.",
+    )
+    parser.add_argument(
+        "--peer-avoidance-trigger-distance",
+        type=float,
+        default=2.5,
+        help="Distance at which a head-on peer starts yielding or inserting a bypass route.",
+    )
+    parser.add_argument(
+        "--peer-avoidance-path-margin",
+        type=float,
+        default=0.5,
+        help="Only avoid a same-lane peer when it is on this robot's current segment plus this margin.",
+    )
+    parser.add_argument(
+        "--peer-avoidance-lateral-offset",
+        type=float,
+        default=1.0,
+        help="Side-step distance for the evading robot's temporary bypass lane.",
+    )
+    parser.add_argument(
+        "--peer-avoidance-pass-distance",
+        type=float,
+        default=1.5,
+        help="How far past the peer the evading robot rejoins the original lane.",
+    )
+    parser.add_argument(
+        "--peer-yaw-tolerance",
+        type=float,
+        default=0.75,
+        help="Yaw tolerance for deciding that the peer is facing the opposite direction.",
+    )
     parser.add_argument("--yaw-offset", type=float, default=0.0)
     parser.add_argument("--angular-sign", type=float, choices=[-1.0, 1.0], default=1.0)
     parser.add_argument("--lift-joint-name", default="lift_joint")
@@ -408,11 +1539,19 @@ def _parse_args(args: Optional[list[str]] = None) -> argparse.Namespace:
     parser.add_argument("--lift-down-position", type=float, default=0.0)
     parser.add_argument("--wait-after-lift", type=float, default=1.0)
     parser.add_argument("--shelf-stop-duration", type=float, default=1.0)
-    parser.add_argument("--lift-down-hold", type=float, default=1.0)
+    parser.add_argument("--unload-settle-duration", type=float, default=0.5)
+    parser.add_argument("--lift-down-hold", type=float, default=2.0)
+    parser.add_argument("--back-out-speed", type=float, default=1.0)
+    parser.add_argument("--back-out-duration", type=float, default=4.0)
+    parser.add_argument(
+        "--wait-target",
+        choices=["WAIT_1", "WAIT_2", "WAIT_3"],
+        default=default_wait_target,
+    )
     parser.add_argument(
         "--tracking-offset-x",
         type=float,
-        default=-0.3,
+        default=-0.5,
         help="Body-frame x offset from odom/chassis to the point that should reach each target.",
     )
     parser.add_argument(
@@ -425,11 +1564,28 @@ def _parse_args(args: Optional[list[str]] = None) -> argparse.Namespace:
     return parser.parse_args(args)
 
 
-def main(args: Optional[list[str]] = None) -> None:
+def main(
+    args: Optional[list[str]] = None,
+    *,
+    default_robot_index: int = 1,
+    default_stack_target: str = "STACK_1",
+    default_shelf_storage_target: str = "SHELF_STORAGE_1",
+    default_unload_target: str = "UNLOAD_1",
+    default_wait_target: str = "WAIT_1",
+    default_status_topic: str | None = None,
+) -> None:
     if rclpy is None:
         raise RuntimeError("rclpy is not available. Source ROS2 before running robot1_stack_sequence.")
 
-    parsed_args = _parse_args(args)
+    parsed_args = _parse_args(
+        args,
+        default_robot_index=default_robot_index,
+        default_stack_target=default_stack_target,
+        default_shelf_storage_target=default_shelf_storage_target,
+        default_unload_target=default_unload_target,
+        default_wait_target=default_wait_target,
+        default_status_topic=default_status_topic,
+    )
     rclpy.init(args=args)
     node = Robot1StackSequence(parsed_args)
     try:

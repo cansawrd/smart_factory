@@ -32,9 +32,9 @@ PLACE_CANDIDATES: dict[str, list[WorldPoint]] = {
     # Temporary test coordinates for the transport robot's main work areas.
     # The world z coordinate is currently 0.0 for all places; axis navigation
     # uses only x/y.
-    "WAIT": [(12.0, 15.0), (12.0, 10.0), (12.0, 7.0)],
-    "STACK": [(-13.0, 0.0)],
-    "SHELF_STORAGE": [(0.0, -10.0)],
+    "WAIT": [(12.0, 15.0), (6.0, 15.0), (0.0, 15.0)],
+    "STACK": [(-13.0, 0.0), (-13.0, 2.0)],
+    "SHELF_STORAGE": [(0.0, -10.0), (0.0, 10.0), (0.0, 0.0)],
     "UNLOAD": [(13.0, -10.0), (13.0, 0.0), (13.0, 10.0)],
 }
 
@@ -136,13 +136,17 @@ def compute_axis_nav_command(
     yaw_tolerance: float,
     yaw_offset: float = 0.0,
     angular_sign: float = 1.0,
+    allow_crossed_axis_target: bool = True,
+    axis_aligned_heading: bool = True,
 ) -> AxisNavCommand:
     dx = target[0] - pose.x
     dy = target[1] - pose.y
     distance = math.hypot(dx, dy)
     axis_error = _axis_error(pose, target, active_axis)
     crossed_axis_target = _crossed_axis_target(segment_start, pose, target, active_axis)
-    if abs(axis_error) <= distance_tolerance or crossed_axis_target:
+    if abs(axis_error) <= distance_tolerance or (
+        allow_crossed_axis_target and crossed_axis_target
+    ):
         return AxisNavCommand(
             linear_x=0.0,
             angular_z=0.0,
@@ -155,7 +159,11 @@ def compute_axis_nav_command(
             crossed_axis_target=crossed_axis_target,
         )
 
-    target_yaw = math.atan2(dy, dx)
+    target_yaw = (
+        _axis_target_yaw(axis_error, active_axis)
+        if axis_aligned_heading
+        else math.atan2(dy, dx)
+    )
     control_yaw = normalize_angle(pose.yaw + yaw_offset)
     yaw_error = normalize_angle(target_yaw - control_yaw)
     angular_z = _clamp(1.5 * yaw_error * angular_sign, -max_angular_speed, max_angular_speed)
@@ -173,7 +181,8 @@ def compute_axis_nav_command(
             crossed_axis_target=crossed_axis_target,
         )
 
-    linear_x = min(max_linear_speed, max(0.08, distance * 0.5))
+    speed_error = abs(axis_error) if axis_aligned_heading else distance
+    linear_x = min(max_linear_speed, max(0.08, speed_error * 0.2))
     return AxisNavCommand(
         linear_x=linear_x,
         angular_z=angular_z,
@@ -191,6 +200,12 @@ def _axis_error(pose: Pose2D, target: WorldPoint, active_axis: str) -> float:
     if active_axis == "x":
         return target[0] - pose.x
     return target[1] - pose.y
+
+
+def _axis_target_yaw(axis_error: float, active_axis: str) -> float:
+    if active_axis == "x":
+        return 0.0 if axis_error >= 0.0 else math.pi
+    return math.pi / 2.0 if axis_error >= 0.0 else -math.pi / 2.0
 
 
 def _crossed_axis_target(
